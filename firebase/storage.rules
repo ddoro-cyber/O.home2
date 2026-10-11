@@ -1,0 +1,20 @@
+rules_version = '2';
+
+// ============================================================
+// O.HOME Storage 보안 규칙 (이미지·파일)
+// Firebase 콘솔 → Storage → 규칙 에 붙여넣고 [게시].
+//   · 읽기는 공개 (그림 주소를 아는 사람은 볼 수 있다 — 주소는 홈 안에서만 노출된다)
+//   · 올리기·지우기는 로그인 회원만
+//   · 한 번에 20MB 초과 업로드 차단
+// ============================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /ohome/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.auth != null
+        && request.resource.size < 20 * 1024 * 1024;
+      allow delete: if request.auth != null;
+    }
+  }
+}
