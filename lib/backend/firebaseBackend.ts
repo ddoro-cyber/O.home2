@@ -1,0 +1,550 @@
+'use client';
+// Firebase 백엔드 — Firestore(문서=항목) + Auth + Storage
+// 권한 규칙: firebase/firestore.rules · firebase/storage.rules
+//
+// Supabase 판과 같은 모양으로 맞춘 부분:
+//  · 컬렉션 이름 동일 (posts, characters, …)
+//  · 문서 = 항목 하나, 필드는 { data, authorId, visibility, sort }
+//  · 관리자 판정은 meta/owner 문서 — 첫 로그인 계정이 소유자로 등록된다(규칙이 1회만 허용)
+import {
+  Backend, BackendCheck, BackendConfig, BackendUser, HomeRow, ListItem, CONTENT_COLLECTIONS, diffList, metaOf,
+} from './types';
+import { visFloorOf } from '../visFloor';
+
+type FirebaseCfg = Extract<BackendConfig, { kind: 'firebase' }>;
+
+export async function createFirebaseBackend(cfg: FirebaseCfg): Promise<Backend> {
+  const [{ initializeApp, getApps, getApp }, authMod, fsMod, stMod] = await Promise.all([
+    import('firebase/app'),
+    import('firebase/auth'),
+    import('firebase/firestore'),
+    import('firebase/storage'),
+  ]);
+
+  const app = getApps().length ? getApp() : initializeApp({
+    apiKey: cfg.apiKey,
+    authDomain: cfg.authDomain,
+    projectId: cfg.projectId,
+    storageBucket: cfg.storageBucket,
+    appId: cfg.appId,
+    ...(cfg.messagingSenderId ? { messagingSenderId: cfg.messagingSenderId } : {}),
+  });
+
+  const auth = authMod.getAuth(app);
+  // 콘솔에서 데이터베이스를 (default)가 아닌 이름으로 만든 경우를 위해 ID를 받는다
+  const dbId = (cfg.databaseId ?? '').trim();
+  const named = !!dbId && dbId !== '(default)';
+  // ignoreUndefinedProperties — 화면 데이터에는 값이 없는 필드가 undefined로 남는데(grants 등),
+  // JSON 저장에서는 자동으로 빠지지만 Firestore는 거부한다. 같은 동작이 되도록 건너뛰게 한다.
+  const db = (() => {
+    const opts = { ignoreUndefinedProperties: true };
+    try {
+      return named ? fsMod.initializeFirestore(app, opts, dbId) : fsMod.initializeFirestore(app, opts);
+    } catch {
+      // 이미 만들어진 인스턴스가 있으면 그걸 쓴다 (백엔드를 두 번 만드는 경로)
+      return named ? fsMod.getFirestore(app, dbId) : fsMod.getFirestore(app);
+    }
+  })();
+  const storage = stMod.getStorage(app);
+
+  const {
+    collection, doc, getDoc, getDocs, getDocsFromServer, setDoc, deleteDoc, query, where, onSnapshot, writeBatch, limit,
+  } = fsMod;
+  type Cons = ReturnType<typeof where>;
+
+  /* 홈(자관) 범위 (v2.1) — 콘텐츠·설정은 homes/{homeId}/… 아래에 둔다. 홈이 정해지기 전(리스트 화면·
+     비로그인)에는 최상위를 가리키지만, 그때는 읽을 것도 쓸 것도 없다. */
+  let homeId: string | null = null;
+  const col = (name: string) => (homeId ? collection(db, 'homes', homeId, name) : collection(db, name));
+  const ref = (name: string, id: string) => (homeId ? doc(db, 'homes', homeId, name, id) : doc(db, name, id));
+
+  // Firestore SDK는 서버에 못 닿으면 무한 재시도한다 — 쓰기가 영영 안 끝나는 것을 막는다
+  const TIMEOUT = Symbol('timeout');
+  const withLimit = <X,>(p: Promise<X>, ms = 12000) =>
+    Promise.race([p, new Promise<typeof TIMEOUT>(r => setTimeout(() => r(TIMEOUT), ms))]);
+  const NO_REACH = dbId
+    ? `Firestore에 저장하지 못했습니다 — 데이터베이스 ID "${dbId}"가 맞는지 확인해 주세요.`
+    : 'Firestore에 저장하지 못했습니다 — 데이터베이스가 만들어졌는지, 이름이 (default)인지 확인해 주세요.';
+
+  /** 관리자 여부 — meta/owner 문서의 uid 또는 admins 목록 */
+  const ownerInfo = async (): Promise<{ uid?: string; admins?: string[] } | null> => {
+    try {
+      const snap = await getDoc(doc(db, 'meta', 'owner'));
+      return snap.exists() ? (snap.data() as { uid?: string; admins?: string[] }) : null;
+    } catch { return null; }
+  };
+
+  // 목록을 읽을 때마다 meta/owner를 다시 읽지 않도록 (읽기 횟수도 요금이다)
+  let ownerCache: { uid?: string; admins?: string[] } | null | undefined;
+  const ownerNow = async () => {
+    if (ownerCache === undefined) ownerCache = await ownerInfo();
+    return ownerCache;
+  };
+  const isAdminNow = async () => {
+    const u = auth.currentUser;
+    if (!u) return false;
+    const own = await ownerNow();
+    return own?.uid === u.uid || (own?.admins ?? []).includes(u.uid);
+  };
+  authMod.onAuthStateChanged(auth, () => { ownerCache = undefined; });
+
+  /**
+   * 로그인 상태에 맞는 목록 질의 조건.
+   *
+   * Firestore는 **규칙으로 못 읽을 문서가 섞일 수 있는 질의를 통째로 거부한다.**
+   * (Supabase의 RLS는 행을 조용히 걸러 주므로 조건 없이 읽어도 되지만, 여기서는 아니다.)
+   * 조건 없이 읽으면 비로그인 방문자에게 전체공개 글까지 하나도 안 보인다 — 목록 요청 자체가 거부되기 때문.
+   *
+   * 정렬(orderBy)은 일부러 붙이지 않는다. where + orderBy 조합은 복합 색인을 만들어야 해서
+   * 설치한 사람이 콘솔에서 색인을 추가해야 하기 때문 — 대신 받은 뒤 sort로 정렬한다.
+   */
+  const readSets = async (): Promise<Cons[][]> => {
+    const u = auth.currentUser;
+    // 비로그인·홈 미정은 아무것도 읽지 않는다 (v2.1 — 홈은 전부 로그인 뒤에만 보인다)
+    if (!u || !homeId) return [];
+    if (await isAdminNow()) return [[]];                    // 관리자는 전부
+    // 회원: 전체공개+회원공개, 그리고 내가 쓴 것(비공개 포함)은 따로 받아 합친다
+    return [[where('visibility', 'in', ['public', 'member'])], [where('authorId', '==', u.uid)]];
+  };
+
+  const listQuery = (coll: string, cs: Cons[]) =>
+    (cs.length ? query(col(coll), ...cs) : query(col(coll)));
+
+  const toUser = async (u: { uid: string; email?: string | null; displayName?: string | null } | null): Promise<BackendUser | null> => {
+    if (!u) return null;
+    // 이메일을 그대로 이름으로 쓰지 않는다 — 회원 목록·댓글에 남의 메일 주소가 그대로 노출된다.
+    // (프로필 저장 직후에는 displayName이 아직 비어 있어 여기로 떨어질 수 있다)
+    let nickname = u.displayName || (u.email ? u.email.split('@')[0] : 'user');
+    let avatarUrl: string | undefined;
+    let avatarColor: string | undefined;
+    let userHome: string | undefined;
+    try {
+      const p = await getDoc(doc(db, 'profiles', u.uid));
+      if (p.exists()) {
+        const d = p.data() as { nickname?: string; avatarUrl?: string; avatarColor?: string; homeId?: string };
+        nickname = d.nickname ?? nickname;
+        avatarUrl = d.avatarUrl;
+        avatarColor = d.avatarColor;
+        userHome = d.homeId || undefined;
+      }
+    } catch { /* 규칙이 막으면 기본값 */ }
+    const own = await ownerInfo();
+    const isAdmin = !!own && (own.uid === u.uid || (own.admins ?? []).includes(u.uid));
+    return {
+      id: u.uid, nickname, role: isAdmin ? 'admin' : 'member',
+      email: u.email ?? undefined, avatarUrl, avatarColor, homeId: userHome,
+    };
+  };
+
+  const humanError = (e: unknown): string => {
+    const code = (e as { code?: string })?.code ?? '';
+    if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) {
+      return '아이디 또는 비밀번호가 올바르지 않습니다.';
+    }
+    if (code.includes('email-already-in-use')) return '이미 사용 중인 이메일입니다.';
+    if (code.includes('weak-password')) return '비밀번호는 6자 이상이어야 합니다.';
+    if (code.includes('invalid-email')) return '이메일 형식이 올바르지 않습니다.';
+    if (code.includes('operation-not-allowed')) return 'Firebase 콘솔에서 이메일/비밀번호 로그인을 켜 주세요 (Authentication → Sign-in method).';
+    if (code.includes('permission-denied')) return '권한이 없습니다 — 보안 규칙이 적용됐는지 확인해 주세요.';
+    return (e as { message?: string })?.message ?? '알 수 없는 오류입니다.';
+  };
+
+  return {
+    kind: 'firebase',
+
+    async check(): Promise<BackendCheck> {
+      const fail = (p: Partial<BackendCheck>): BackendCheck =>
+        ({ ok: false, reachable: false, schema: false, hasAdmin: false, message: '', ...p });
+      // Firestore는 테이블을 미리 만들지 않는다 — 대신 "읽기가 되는지(규칙 적용 여부)"를 본다.
+      // 반드시 getDocsFromServer — 일반 getDocs는 서버에 못 닿아도 로컬 캐시로 성공해서,
+      // 데이터베이스가 없는데도 확인을 통과시켜 버린다(그 뒤 쓰기에서 멈춘다).
+      try {
+        const r = await withLimit(getDocsFromServer(query(collection(db, 'settings'), limit(1))));
+        if (r === TIMEOUT) {
+          return fail({ message: '응답이 없습니다 — projectId가 맞는지, Firestore 데이터베이스를 만들었는지 확인해 주세요.' });
+        }
+      } catch (e) {
+        const code = (e as { code?: string })?.code ?? '';
+        const msg = (e as { message?: string })?.message ?? '';
+        if (code.includes('permission-denied')) {
+          return fail({ reachable: true, message: '보안 규칙이 아직 적용되지 않았습니다 — 아래 규칙을 Firebase 콘솔의 Firestore → 규칙에 붙여넣고 게시해 주세요.' });
+        }
+        // 데이터베이스 자체가 없을 때 — 가장 흔한 첫 설치 실수
+        if (code.includes('not-found') || /Database .* not found|NOT_FOUND/i.test(msg)) {
+          return fail({
+            message: dbId
+              ? `"${dbId}" 데이터베이스를 찾을 수 없습니다 — Firebase 콘솔의 Firestore Database에서 그 이름이 맞는지 확인해 주세요.`
+              : 'Firestore 데이터베이스가 없습니다 — Firebase 콘솔 → Firestore Database에서 [데이터베이스 만들기]를 먼저 해 주세요. 이미 만들었다면 데이터베이스 ID가 (default)인지 확인해 주세요.',
+          });
+        }
+        if (code.includes('unavailable') || code.includes('failed-precondition')) {
+          return fail({ message: 'Firestore가 아직 준비되지 않았습니다 — Firebase 콘솔에서 Firestore 데이터베이스를 먼저 만들어 주세요.' });
+        }
+        return fail({ message: `연결에 실패했습니다 — ${humanError(e)}` });
+      }
+      const own = await ownerInfo();
+      const hasAdmin = !!own?.uid;
+      return {
+        ok: true, reachable: true, schema: true, hasAdmin,
+        message: hasAdmin ? '연결 완료 — 관리자 계정이 이미 있습니다. 그 계정으로 로그인해 주세요.'
+          : '연결 완료 — 이제 관리자 계정을 만들면 됩니다. 첫 번째 계정이 총관리자가 됩니다.',
+      };
+    },
+
+    async currentUser() {
+      // 새로고침 직후 auth 복원을 기다린다
+      const u = await new Promise<typeof auth.currentUser>(res => {
+        const off = authMod.onAuthStateChanged(auth, x => { off(); res(x); });
+      });
+      return toUser(u);
+    },
+
+    onAuthChange(cb) {
+      return authMod.onAuthStateChanged(auth, u => { void toUser(u).then(cb); });
+    },
+
+    async signIn(id, password) {
+      try {
+        await authMod.signInWithEmailAndPassword(auth, id, password);
+        return { ok: true };
+      } catch (e) { return { ok: false, error: humanError(e) }; }
+    },
+
+    async signUp(id, password, nickname, inviteCode) {
+      try {
+        const cred = await authMod.createUserWithEmailAndPassword(auth, id, password);
+        await authMod.updateProfile(cred.user, { displayName: nickname });
+        const profile: Record<string, unknown> = { nickname, createdAt: Date.now() };
+        if (inviteCode !== undefined) {
+          /* 가입코드 → 홈 (v2.1). 코드 조회는 **계정을 만든 뒤** invites/{코드} 문서 한 건을 읽는 것으로만 한다
+             (v2.1.1 보안 수정 — 예전엔 homes 컬렉션을 통째로 질의했는데, 규칙이 「프로필 없는 로그인 계정」에게
+             homes 읽기를 열어 둬서 계정만 만들면 모든 자관의 코드를 볼 수 있었다). invites는 정확한 코드를
+             알아야만 get이 되고 목록 조회(list)는 규칙이 막는다 — 모르는 코드는 캐낼 수 없다.
+             코드가 틀리면 방금 만든 계정을 도로 지운다 — 남겨 두면 「이미 사용 중」으로 다시 못 쓴다. */
+          const code = inviteCode.trim();
+          let hitHome: string | null = null;
+          if (code) {
+            try {
+              const inv = await getDoc(doc(db, 'invites', code));
+              hitHome = inv.exists() ? String((inv.data() as { homeId?: string }).homeId ?? '') || null : null;
+            } catch { hitHome = null; }
+          }
+          if (!hitHome) {
+            try { await cred.user.delete(); } catch { await authMod.signOut(auth); }
+            return { ok: false, error: '가입코드가 올바르지 않습니다.' };
+          }
+          profile.homeId = hitHome;
+          profile.joinCode = code;   // 규칙이 홈의 코드와 대조한다 — 아무 홈에나 끼어드는 것을 서버가 막는다
+        }
+        const r = await withLimit(setDoc(doc(db, 'profiles', cred.user.uid), profile, { merge: true }));
+        // 계정(Auth)은 이미 만들어졌으므로 그 사실을 알려 준다 — 다시 시도하면 "이미 사용 중"이 뜬다
+        if (r === TIMEOUT) return { ok: false, error: `${NO_REACH} (로그인 계정은 이미 만들어졌습니다)` };
+        return { ok: true };
+      } catch (e) { return { ok: false, error: humanError(e) }; }
+    },
+
+    async signOut() { await authMod.signOut(auth); },
+
+    async resetPassword(email) {
+      try {
+        await authMod.sendPasswordResetEmail(auth, email);
+        return { ok: true };
+      } catch (e) { return { ok: false, error: humanError(e) }; }
+    },
+
+    async updateProfile(patch) {
+      const u = auth.currentUser;
+      if (!u) return { ok: false, error: '로그인이 필요합니다.' };
+      // 비밀번호 — 현재 비밀번호로 다시 인증한 뒤 바꾼다 (Firebase는 민감한 작업에 최근 로그인을 요구한다 — 재인증이 그 조건도 채운다).
+      // 여태 이 항목이 빠져 있어 마이페이지가 「변경되었습니다」만 띄우고 실제로는 안 바뀌었다 (커플홈 사용자 제보)
+      if (patch.newPassword) {
+        if (!u.email) return { ok: false, error: '이 계정은 이메일/비밀번호 로그인이 아니라 비밀번호를 바꿀 수 없습니다.' };
+        if (!patch.currentPassword) return { ok: false, error: '현재 비밀번호를 입력해 주세요.' };
+        try {
+          const cred = authMod.EmailAuthProvider.credential(u.email, patch.currentPassword);
+          await authMod.reauthenticateWithCredential(u, cred);
+          await authMod.updatePassword(u, patch.newPassword);
+        } catch (e) {
+          const code = (e as { code?: string })?.code ?? '';
+          if (code.includes('wrong-password') || code.includes('invalid-credential') || code.includes('invalid-login-credentials')) {
+            return { ok: false, error: '현재 비밀번호가 올바르지 않습니다.' };
+          }
+          if (code.includes('too-many-requests')) return { ok: false, error: '시도가 너무 많습니다 — 잠시 뒤 다시 해 주세요.' };
+          return { ok: false, error: humanError(e) };
+        }
+      }
+      try {
+        const row: Record<string, unknown> = {};
+        if (patch.nickname !== undefined) row.nickname = patch.nickname;
+        if (patch.avatarUrl !== undefined) row.avatarUrl = patch.avatarUrl ?? null;
+        if (patch.avatarColor !== undefined) row.avatarColor = patch.avatarColor ?? null;
+        if (Object.keys(row).length) await setDoc(doc(db, 'profiles', u.uid), row, { merge: true });
+        if (patch.nickname) await authMod.updateProfile(u, { displayName: patch.nickname });
+        return { ok: true };
+      } catch (e) { return { ok: false, error: humanError(e) }; }
+    },
+
+    /** 첫 계정을 소유자(관리자)로 등록 — 규칙이 "없을 때 1회"만 허용한다 */
+    async claimOwner() {
+      const u = auth.currentUser;
+      if (!u) return { ok: false, error: '로그인이 필요합니다.' };
+      try {
+        const own = await ownerInfo();
+        if (own?.uid) return { ok: true };   // 이미 소유자 있음
+        const r = await withLimit(setDoc(doc(db, 'meta', 'owner'), { uid: u.uid, admins: [u.uid], at: Date.now() }));
+        if (r === TIMEOUT) return { ok: false, error: NO_REACH };
+        ownerCache = undefined;   // 방금 관리자가 됐으니 다시 판정하게
+        return { ok: true };
+      } catch (e) { return { ok: false, error: humanError(e) }; }
+    },
+
+    async listMembers() {
+      const own = await ownerInfo();
+      const admins = new Set([own?.uid, ...(own?.admins ?? [])].filter(Boolean) as string[]);
+      // 총관리자는 전부, 회원은 **자기 홈의 회원만** 질의한다 (v2.1.1 — 규칙이 다른 홈의 프로필을 막으므로
+      // 전체 조회는 통째로 거부된다). 홈이 없는 계정은 자기 것만
+      let snap;
+      if (await isAdminNow()) {
+        snap = await getDocs(collection(db, 'profiles'));
+      } else {
+        const me = auth.currentUser ? await toUser(auth.currentUser) : null;
+        if (!me?.homeId) return [];   // 홈 없는 계정은 볼 회원도 없다
+        snap = await getDocs(query(collection(db, 'profiles'), where('homeId', '==', me.homeId)));
+      }
+      return snap.docs.map(d => {
+        // avatarUrl도 함께 — 이미지 정리가 프로필 사진을 「안 쓰는 파일」로 지우지 않게 (v2.0 사용자 제보)
+        const v = d.data() as { nickname?: string; avatarUrl?: string; homeId?: string };
+        return {
+          id: d.id,
+          nickname: v.nickname ?? d.id,
+          role: (admins.has(d.id) ? 'admin' : 'member') as 'admin' | 'member',
+          avatarUrl: v.avatarUrl,
+          homeId: v.homeId || undefined,
+        };
+      });
+    },
+
+    /* ---- 홈(자관) (v2.1) ---- */
+    setHome(id) { homeId = id; },
+
+    async listHomes() {
+      const rowOf = (id: string, v: Record<string, unknown>): HomeRow => ({
+        id, name: String(v.name ?? id), inviteCode: String(v.inviteCode ?? ''),
+        createdAt: typeof v.createdAt === 'number' ? v.createdAt : undefined,
+      });
+      if (await isAdminNow()) {
+        const snap = await getDocs(collection(db, 'homes'));
+        const rows = snap.docs.map(d => rowOf(d.id, d.data() as Record<string, unknown>))
+          .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+        // invites/{코드} 보정 (v2.1.1) — 이 구조가 생기기 전에 만든 자관은 코드 문서가 없어 가입이 막힌다.
+        // 총관리자가 리스트를 열 때 빠진 것만 채운다 (한 번 채우면 다시 쓰지 않는다)
+        for (const h of rows) {
+          if (!h.inviteCode) continue;
+          try {
+            const inv = await getDoc(doc(db, 'invites', h.inviteCode));
+            if (!inv.exists() || (inv.data() as { homeId?: string }).homeId !== h.id) {
+              await setDoc(doc(db, 'invites', h.inviteCode), { homeId: h.id });
+            }
+          } catch { /* 규칙 미게시 등 — 리스트 자체는 보여 준다 */ }
+        }
+        return rows;
+      }
+      // 회원은 자기 홈 하나만 (규칙도 그 하나만 읽게 한다)
+      const me = auth.currentUser ? await toUser(auth.currentUser) : null;
+      if (!me?.homeId) return [];
+      const snap = await getDoc(doc(db, 'homes', me.homeId));
+      return snap.exists() ? [rowOf(snap.id, snap.data() as Record<string, unknown>)] : [];
+    },
+
+    async createHome(h) {
+      const r = await withLimit(setDoc(doc(db, 'homes', h.id), {
+        name: h.name, inviteCode: h.inviteCode, createdAt: h.createdAt ?? Date.now(),
+      }));
+      if (r === TIMEOUT) throw new Error(NO_REACH);
+      // 가입코드 → 홈 조회용 문서 (v2.1.1) — 가입 때는 이 문서 한 건만 읽는다
+      if (h.inviteCode) await setDoc(doc(db, 'invites', h.inviteCode), { homeId: h.id });
+    },
+
+    async updateHome(id, patch) {
+      // 코드가 바뀌면 invites 문서도 옮긴다 — 옛 코드로는 더 못 들어오게
+      if (patch.inviteCode !== undefined) {
+        const before = await getDoc(doc(db, 'homes', id));
+        const old = before.exists() ? String((before.data() as { inviteCode?: string }).inviteCode ?? '') : '';
+        if (old && old !== patch.inviteCode) { try { await deleteDoc(doc(db, 'invites', old)); } catch { /* 없으면 무시 */ } }
+        if (patch.inviteCode) await setDoc(doc(db, 'invites', patch.inviteCode), { homeId: id });
+      }
+      await setDoc(doc(db, 'homes', id), patch, { merge: true });
+    },
+
+    async deleteHome(id) {
+      // 홈 문서만 지우면 하위 컬렉션은 남는다(Firestore는 하위를 자동으로 지우지 않는다) —
+      // 설정과 알려진 콘텐츠 컬렉션을 모두 훑어 지운 뒤 홈 문서를 지운다. 관리자는 전부 읽을 수 있다.
+      const wipe = async (c: ReturnType<typeof collection>) => {
+        const snap = await getDocs(c);
+        for (let i = 0; i < snap.docs.length; i += 400) {
+          const batch = writeBatch(db);
+          snap.docs.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+          await batch.commit();
+        }
+      };
+      for (const name of [...CONTENT_COLLECTIONS, 'settings']) await wipe(collection(db, 'homes', id, name));
+      // 가입코드 문서도 — 지운 자관의 코드로 가입이 되면 안 된다
+      try {
+        const before = await getDoc(doc(db, 'homes', id));
+        const code = before.exists() ? String((before.data() as { inviteCode?: string }).inviteCode ?? '') : '';
+        if (code) await deleteDoc(doc(db, 'invites', code));
+      } catch { /* 무시 */ }
+      await deleteDoc(doc(db, 'homes', id));
+    },
+
+    async setMemberHome(uid, home) {
+      // 규칙: 총관리자는 프로필을 마음대로 고칠 수 있다 (회원 본인은 homeId를 못 바꾼다)
+      await setDoc(doc(db, 'profiles', uid), { homeId: home ?? null }, { merge: true });
+    },
+
+    async fetchList<T extends ListItem>(coll: string): Promise<T[]> {
+      const sets = await readSets();
+      // 반드시 getDocsFromServer — 일반 getDocs는 로컬(오프라인) 캐시가 있으면 그걸로 조용히 성공해
+      // 버린다. 실시간 구독이 한 번의 쓰기에 두 번(로컬 반영·서버 확정) 반응해 재조회가 겹칠 때
+      // 낡은 캐시 결과가 방금 반영된 변경을 도로 덮어써 "새로고침해야 보임"이 되던 원인 중 하나
+      // (v2.0 사용자 발견 — 목록 숨김을 바꿔도 반영이 안 되는 것처럼 보임)
+      const snaps = await Promise.all(sets.map(cs => getDocsFromServer(listQuery(coll, cs))));
+      // 두 질의(공개분 · 내 글)를 합치므로 문서 id로 중복을 없앤 뒤 sort로 정렬한다
+      const seen = new Map<string, { sort: number; item: T }>();
+      snaps.forEach(s => s.docs.forEach(d => {
+        if (seen.has(d.id)) return;
+        const raw = d.data() as { data?: Record<string, unknown>; sort?: number };
+        seen.set(d.id, { sort: raw.sort ?? 0, item: { ...(raw.data ?? {}), id: d.id } as T });
+      }));
+      return [...seen.values()].sort((a, b) => a.sort - b.sort).map(v => v.item);
+    },
+
+    async fetchOne<T extends ListItem>(coll: string, id: string): Promise<T | null> {
+      try {
+        const d = await getDoc(ref(coll, id));   // 홈(자관) 경로 — JN은 homes/{id}/… 아래에 둔다
+        if (!d.exists()) return null;
+        const raw = d.data() as { data?: Record<string, unknown> };
+        return { ...(raw.data ?? {}), id: d.id } as T;
+      } catch {
+        return null;   // 읽기 규칙에 막힘(권한 없음) 등 — 없는 것으로
+      }
+    },
+
+    async syncList<T extends ListItem>(coll: string, prev: T[], next: T[], uid: string | null) {
+      const { inserts, updates, moves, deletes } = diffList(prev, next);
+      const ops = [...inserts, ...updates];
+      // Firestore 배치는 500개 제한에 **요청 크기 10MiB 제한**도 있다 (v2.0 포크 제보 — 큰 로그
+      // 본문 저장 실패). 개수(400)만 보고 끊으면 700KB짜리 본문 문서 십수 개에 10MiB를 넘어
+      // 배치가 통째로 거부된다 — 대략 크기를 재서 8MB쯤에서 미리 끊는다.
+      const parts: { item: T; sort: number }[][] = [];
+      let cur: { item: T; sort: number }[] = [];
+      let bytes = 0;
+      for (const op of ops) {
+        const size = JSON.stringify(op.item).length + 200;
+        if (cur.length && (cur.length >= 400 || bytes + size > 8_000_000)) { parts.push(cur); cur = []; bytes = 0; }
+        cur.push(op); bytes += size;
+      }
+      if (cur.length) parts.push(cur);
+      for (const part of parts) {
+        const batch = writeBatch(db);
+        part.forEach(({ item, sort }) => {
+          const { authorId, visibility, editorIds } = metaOf(item, uid, visFloorOf(coll, item));
+          batch.set(ref(coll, item.id), {
+            data: item, authorId, visibility, editorIds, sort, updatedAt: Date.now(),
+          });
+        });
+        await batch.commit();
+      }
+      const chunk = <X,>(arr: X[], n: number) =>
+        Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+      // 자리만 바뀐 항목 — sort만 고친다 (본문까지 다시 보내지 않게, 위 diffList 주석 참조)
+      for (const part of chunk(moves, 400)) {
+        const batch = writeBatch(db);
+        part.forEach(({ id, sort }) => batch.update(ref(coll, id), { sort, updatedAt: Date.now() }));
+        await batch.commit();
+      }
+      for (const part of chunk(deletes, 400)) {
+        const batch = writeBatch(db);
+        part.forEach(id => batch.delete(ref(coll, id)));
+        await batch.commit();
+      }
+    },
+
+    /* 공개범위·편집 권한 목록만 다시 계산해 덮어쓰기 (v2.0) — data·sort는 손대지 않는다.
+       editorIds도 함께 쓴다 (포크 제보 — 업데이트 전에 준 편집 권한이 문서에 평평한 목록으로
+       없어서, 최신 규칙을 넣어도 그 회원의 저장이 계속 거부됐다) */
+    async refreshVis<T extends ListItem>(coll: string, items: T[], uid: string | null): Promise<number> {
+      let n = 0;
+      for (let i = 0; i < items.length; i += 400) {
+        const part = items.slice(i, i + 400);
+        const batch = writeBatch(db);
+        part.forEach(it => {
+          const { visibility, editorIds } = metaOf(it, uid, visFloorOf(coll, it));
+          batch.update(ref(coll, it.id), { visibility, editorIds, updatedAt: Date.now() });
+        });
+        await batch.commit();
+        n += part.length;
+      }
+      return n;
+    },
+
+    subscribe(coll, onChange) {
+      // 조건이 두 갈래면 구독도 두 개 — fetchList와 같은 이유(질의 전체 거부 방지)
+      let offs: Array<() => void> = [];
+      let stopped = false;
+      void readSets().then(sets => {
+        if (stopped) return;
+        offs = sets.map(cs => onSnapshot(listQuery(coll, cs), () => onChange(), () => { /* 권한 없음 등은 무시 */ }));
+      });
+      return () => { stopped = true; offs.forEach(off => off()); offs = []; };
+    },
+
+    async fetchSetting<T>(key: string) {
+      const snap = await getDoc(ref('settings', key));
+      return snap.exists() ? ((snap.data() as { value: T }).value ?? null) : null;
+    },
+
+    async saveSetting(key, value) {
+      await setDoc(ref('settings', key), { value, updatedAt: Date.now() });
+    },
+
+    async fetchAllSettings() {
+      const snap = await getDocs(col('settings'));
+      const out: Record<string, unknown> = {};
+      snap.docs.forEach(d => { out[d.id] = (d.data() as { value: unknown }).value; });
+      return out;
+    },
+
+    async uploadFile(blob, ext) {
+      const path = `ohome/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const r = stMod.ref(storage, path);
+      // 경로가 업로드마다 고유하므로 내용이 바뀌지 않는다 — 길게 캐시해 재방문·엣지 캐시 이득을 본다
+      // (지정하지 않으면 브라우저가 매번 다시 받아 먼 지역 버킷에서 지연이 그대로 드러남)
+      await stMod.uploadBytes(r, blob, {
+        contentType: blob.type || 'application/octet-stream',
+        cacheControl: 'public, max-age=31536000, immutable',
+      });
+      return await stMod.getDownloadURL(r);
+    },
+
+    async listFiles() {
+      // 저장하는 주소가 다운로드 URL이므로 목록도 같은 형태로 돌려줘야 대조가 된다
+      const res = await stMod.listAll(stMod.ref(storage, 'ohome'));
+      return Promise.all(res.items.map(async it => {
+        const [ref, meta] = await Promise.all([stMod.getDownloadURL(it), stMod.getMetadata(it)]);
+        return { ref, size: meta.size ?? 0 };
+      }));
+    },
+
+    async deleteFile(ref) {
+      // Firebase SDK는 다운로드 URL로도 참조를 만들 수 있다
+      await stMod.deleteObject(stMod.ref(storage, ref));
+    },
+
+    async deleteMember(id) {
+      // profiles 문서만 지운다 — Authentication 계정은 관리자 키가 있어야 지울 수 있다
+      await deleteDoc(doc(db, 'profiles', id));
+    },
+  };
+
+}
